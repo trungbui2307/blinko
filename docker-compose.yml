@@ -6,11 +6,7 @@ networks:
 
 services:
   blinko-website:
-    build:
-      context: .
-      dockerfile: ./dockerfile
-      args:
-        USE_MIRROR: "true"
+    image: blinkospace/blinko:latest
     environment:
       NODE_ENV: production
       NEXTAUTH_URL: "${NEXTAUTH_URL}"
