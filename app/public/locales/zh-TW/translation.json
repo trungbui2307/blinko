@@ -282,6 +282,7 @@
   "error": "Error",
   "error-code": "Error Code",
   "error-details": "Error Details",
+  "ai-writing-service-connection-failed": "AI寫作服務連接失敗",
   "every-day": "每天",
   "every-half-year": "每半年",
   "every-month": "每月",
@@ -844,5 +845,13 @@
   "years-ago": "",
   "yesterday": "昨天",
   "your-azure-openai-instance-name": "您的 Azure OpenAI 实例名称",
-  "your-changes-have-been-saved": "您的更改已保存！"
+  "your-changes-have-been-saved": "您的更改已保存！",
+  "enable-signin-footer": "啟用登入頁尾",
+  "signin-footer-text": "登入頁尾內容",
+  "signin-footer-desc": "支援HTML: <a href='...'>連結</a>, <strong>粗體</strong>, <em>斜體</em>, <br/>",
+  "signin-footer-placeholder": "例如：<a href='https://blinko.space/'>Blinko</a> © 2026 Blinko. 版權所有.",
+  "custom-title": "自訂標題",
+  "custom-title-tip": "用於瀏覽器分頁和登入頁標題，留空將使用預設標題。",
+  "custom-title-placeholder": "請輸入標題（1-50個字元）",
+  "login-with": "使用 {{title}} 登入"
 }

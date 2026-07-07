@@ -1,10 +1,11 @@
 import { router, authProcedure, publicProcedure } from '../middleware';
+import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 import { prisma } from '../prisma';
 import { commentsSchema, accountsSchema, NotificationType } from '@shared/lib/prismaZodType';
 import * as crypto from 'crypto';
-import { AiService } from '@server/aiServer';
 import { CreateNotification } from './notification';
+import { buildCommentWebhookPayload, commentAccountSelect, commentWebhookInclude, sendCommentWebhook } from '@server/lib/commentWebhook';
 
 const accountSchema = accountsSchema.pick({
   id: true,
@@ -48,11 +49,98 @@ async function getNestedComments(commentIds: number[]): Promise<any[]> {
     orderBy: { createdAt: 'asc' }
   });
 
-  for (const comment of comments) {
+  for (const comment of comments as any[]) {
     comment.replies = await getNestedComments([comment.id]);
   }
 
   return comments;
+}
+
+async function getCommentDeleteSnapshots(rootComment: any): Promise<any[]> {
+  const comments = [rootComment];
+  const seenIds = new Set<number>([rootComment.id]);
+  let parentIds = [rootComment.id];
+
+  while (parentIds.length > 0) {
+    const replies = await prisma.comments.findMany({
+      where: {
+        parentId: {
+          in: parentIds
+        }
+      },
+      include: {
+        account: {
+          select: commentAccountSelect
+        }
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+    const nextReplies = replies.filter((comment) => !seenIds.has(comment.id));
+    if (nextReplies.length === 0) {
+      break;
+    }
+
+    for (const reply of nextReplies) {
+      seenIds.add(reply.id);
+    }
+    comments.push(...nextReplies);
+    parentIds = nextReplies.map((comment) => comment.id);
+  }
+
+  return comments;
+}
+
+// Security fix: Check if user has access to a note
+async function checkNoteAccess(noteId: number, ctx: any): Promise<boolean> {
+  const note = await prisma.notes.findFirst({
+    where: { id: noteId },
+    select: {
+      accountId: true,
+      isShare: true,
+      sharePassword: true,
+      shareExpiryDate: true
+    }
+  });
+
+  if (!note) {
+    return false;
+  }
+
+  // Check if note is publicly shared (no password, not expired)
+  const isPubliclyShared = note.isShare && 
+    note.sharePassword === '' && 
+    (note.shareExpiryDate === null || note.shareExpiryDate > new Date());
+
+  if (isPubliclyShared) {
+    return true;
+  }
+
+  // If user is not authenticated, deny access to private notes
+  if (!ctx.id) {
+    return false;
+  }
+
+  const userId = Number(ctx.id);
+
+  // Check if user is superadmin
+  if (ctx.role === 'superadmin') {
+    return true;
+  }
+
+  // Check if user is the note owner
+  if (note.accountId === userId) {
+    return true;
+  }
+
+  // Check if note is internally shared with the user
+  const internalShare = await prisma.noteInternalShare.findFirst({
+    where: {
+      noteId: noteId,
+      accountId: userId
+    }
+  });
+
+  return !!internalShare;
 }
 
 export const commentRouter = router({
@@ -68,6 +156,15 @@ export const commentRouter = router({
     .mutation(async function ({ input, ctx }) {
       let { content, noteId, parentId, guestName } = input;
 
+      // Security fix: Check if user has access to the note
+      const hasAccess = await checkNoteAccess(noteId, ctx);
+      if (!hasAccess) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'You do not have permission to comment on this note'
+        });
+      }
+
       const note = await prisma.notes.findFirst({
         where: {
           id: noteId
@@ -78,7 +175,10 @@ export const commentRouter = router({
       });
 
       if (!note) {
-        throw new Error('Note not found or not shareable');
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: 'Note not found'
+        });
       }
 
       if (parentId) {
@@ -104,10 +204,12 @@ export const commentRouter = router({
       }
 
       if (content.includes('@Blinko AI')) {
-        AiService.AIComment({ content, noteId })
+        import('@server/aiServer')
+          .then(({ AiService }) => AiService.AIComment({ content, noteId }))
+          .catch((error) => console.error('AI comment error:', error));
       }
 
-      await prisma.comments.create({
+      const comment = await prisma.comments.create({
         data: {
           content,
           noteId,
@@ -117,17 +219,9 @@ export const commentRouter = router({
           guestIP: ctx.ip?.toString(),
           guestUA: validGuestUA
         },
-        include: {
-          account: {
-            select: {
-              id: true,
-              name: true,
-              nickname: true,
-              image: true
-            }
-          }
-        }
+        include: commentWebhookInclude
       });
+      sendCommentWebhook('comment.created', comment, ctx);
       if (Number(ctx.id) !== note?.accountId || !ctx.id) {
         CreateNotification({
           type: NotificationType.COMMENT,
@@ -155,8 +249,17 @@ export const commentRouter = router({
       total: z.number(),
       items: z.array(commentWithRelationsSchema)
     }))
-    .query(async function ({ input }) {
+    .query(async function ({ input, ctx }) {
       const { noteId, page, size, orderBy } = input;
+
+      // Security fix: Check if user has access to the note
+      const hasAccess = await checkNoteAccess(noteId, ctx);
+      if (!hasAccess) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'You do not have permission to view comments for this note'
+        });
+      }
 
       const [total, comments] = await Promise.all([
         prisma.comments.count({
@@ -196,7 +299,7 @@ export const commentRouter = router({
       ]);
 
       // Load nested replies recursively
-      for (const comment of comments) {
+      for (const comment of comments as any[]) {
         comment.replies = await getNestedComments([comment.id]);
       }
 
@@ -220,20 +323,27 @@ export const commentRouter = router({
             { accountId: Number(ctx.id) },
             { note: { accountId: Number(ctx.id) } }
           ]
-        }
+        },
+        include: commentWebhookInclude
       });
 
       if (!comment) {
         throw new Error('Comment not found or no permission');
       }
 
+      const deletedComments = await getCommentDeleteSnapshots(comment);
+      const deletedCommentIds = deletedComments.map((comment) => comment.id);
+
       await prisma.comments.deleteMany({
         where: {
-          OR: [
-            { id: input.id },
-            { parentId: input.id }
-          ]
+          id: {
+            in: deletedCommentIds
+          }
         }
+      });
+      sendCommentWebhook('comment.deleted', comment, ctx, {
+        deletedCommentIds,
+        deletedComments: deletedComments.map((comment) => buildCommentWebhookPayload('comment.deleted', comment).comment)
       });
 
       return { success: true };
@@ -253,26 +363,21 @@ export const commentRouter = router({
         where: {
           id,
           accountId: Number(ctx.id)
-        }
+        },
+        include: commentWebhookInclude
       });
 
       if (!comment) {
         throw new Error('Comment not found or no permission');
       }
 
-      return await prisma.comments.update({
+      const updatedComment = await prisma.comments.update({
         where: { id },
         data: { content },
-        include: {
-          account: {
-            select: {
-              id: true,
-              name: true,
-              nickname: true,
-              image: true
-            }
-          }
-        }
+        include: commentWebhookInclude
       });
+      sendCommentWebhook('comment.updated', updatedComment, ctx);
+
+      return updatedComment;
     })
 });

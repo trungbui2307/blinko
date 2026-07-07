@@ -436,12 +436,22 @@ export const attachmentsRouter = router({
 
         const attachment = await tx.attachments.findFirst({
           where: {
-            id: id!
+            id: id!,
+            OR: [
+              {
+                note: {
+                  accountId: Number(ctx.id)
+                }
+              },
+              {
+                accountId: Number(ctx.id)
+              }
+            ]
           }
         });
 
         if (!attachment) {
-          throw new Error('Attachment not found');
+          throw new Error('Attachment not found or you do not have permission to delete it');
         }
 
         try {
@@ -461,11 +471,32 @@ export const attachmentsRouter = router({
     }))
     .mutation(async ({ input, ctx }) => {
       const { ids } = input;
-      await prisma.attachments.deleteMany({
+      // Security fix: Only allow deleting attachments owned by the user
+      const attachments = await prisma.attachments.findMany({
         where: {
-          id: { in: ids }
+          id: { in: ids },
+          OR: [
+            {
+              note: {
+                accountId: Number(ctx.id)
+              }
+            },
+            {
+              accountId: Number(ctx.id)
+            }
+          ]
         }
       });
+
+      // Delete each file from storage (FileService.deleteFile also removes the DB record)
+      for (const attachment of attachments) {
+        try {
+          await FileService.deleteFile(attachment.path);
+        } catch (error) {
+          console.error(`Failed to delete file ${attachment.path}:`, error);
+        }
+      }
+
       return { success: true, message: 'Files deleted successfully' };
     }),
 });
